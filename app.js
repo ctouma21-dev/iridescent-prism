@@ -37,16 +37,59 @@ const GEM_SVG = `
   <line x1="12" y1="24" x2="40" y2="36" stroke="#c7d2fe" stroke-width="0.8" opacity="0.5"/>
 </svg>`;
 
+// NOTE: the Supabase CDN library declares a global `var supabase` on window.
+// This client variable must NOT be named `supabase` or it collides and the
+// whole script fails to parse. `window.supabase` = the library; `sb` = our client.
+let sb      = null;
+let boardId = null;
+
 // =====================================================================
 // STORE — localStorage helpers
 // =====================================================================
 const Store = {
-  getProjects:  ()    => JSON.parse(localStorage.getItem('ip_projects')  || '[]'),
-  saveProjects: (arr) => localStorage.setItem('ip_projects',       JSON.stringify(arr)),
-  getActiveId:  ()    => localStorage.getItem('ip_active_project') || null,
-  setActiveId:  (id)  => id
+  getActiveId: () => localStorage.getItem('ip_active_project') || null,
+  setActiveId: (id) => id
     ? localStorage.setItem('ip_active_project', id)
     : localStorage.removeItem('ip_active_project'),
+};
+
+const DB = {
+  async upsertProject(p) {
+    const { error } = await sb.from('projects').upsert({
+      id: p.id, board_id: boardId, name: p.name, color: p.color, created_at: p.createdAt,
+    });
+    if (error) throw error;
+  },
+  async deleteProject(id) {
+    const { error } = await sb.from('projects').delete().eq('id', id);
+    if (error) throw error;
+  },
+  async upsertTask(t, projectId) {
+    const { error } = await sb.from('tasks').upsert({
+      id: t.id, project_id: projectId, board_id: boardId,
+      title: t.title, description: t.description || null,
+      assignee: t.assignee || null, due_date: t.dueDate || null,
+      priority: t.priority, column_name: t.column, sort_order: t.order,
+      created_at: t.createdAt, completed_at: t.completedAt || null,
+    });
+    if (error) throw error;
+  },
+  async upsertTasks(tasks, projectId) {
+    if (!tasks.length) return;
+    const rows = tasks.map(t => ({
+      id: t.id, project_id: projectId, board_id: boardId,
+      title: t.title, description: t.description || null,
+      assignee: t.assignee || null, due_date: t.dueDate || null,
+      priority: t.priority, column_name: t.column, sort_order: t.order,
+      created_at: t.createdAt, completed_at: t.completedAt || null,
+    }));
+    const { error } = await sb.from('tasks').upsert(rows);
+    if (error) throw error;
+  },
+  async deleteTask(id) {
+    const { error } = await sb.from('tasks').delete().eq('id', id);
+    if (error) throw error;
+  },
 };
 
 // =====================================================================
@@ -54,17 +97,89 @@ const Store = {
 // =====================================================================
 let state = { projects: [], activeProjectId: null, view: 'board' };
 
-function loadState() {
-  state.projects        = Store.getProjects();
-  state.activeProjectId = Store.getActiveId();
+async function fetchConfig() {
+  // 1. Vercel: fetch credentials from the serverless endpoint.
+  try {
+    const res = await fetch('/api/config');
+    if (res.ok) {
+      const json = await res.json();
+      if (json && json.supabaseUrl && json.supabaseKey) return json;
+    }
+  } catch (_) {
+    // /api/config is unavailable on a plain static server (local dev) — fall through.
+  }
+  // 2. Local dev: fall back to globals set by config.local.js.
+  if (window.SUPABASE_URL && window.SUPABASE_KEY) {
+    return { supabaseUrl: window.SUPABASE_URL, supabaseKey: window.SUPABASE_KEY };
+  }
+  // 3. No credentials available anywhere.
+  return null;
+}
 
-  if (state.activeProjectId && !state.projects.find(p => p.id === state.activeProjectId)) {
+async function getOrCreateBoard() {
+  const params = new URLSearchParams(window.location.search);
+  const existing = params.get('board');
+  if (existing) {
+    const { data } = await sb.from('boards').select('id').eq('id', existing).maybeSingle();
+    if (data) return existing;
+  }
+  const { data, error } = await sb.from('boards').insert({}).select('id').single();
+  if (error) throw error;
+  const url = new URL(window.location.href);
+  url.searchParams.set('board', data.id);
+  window.history.replaceState({}, '', url.toString());
+  return data.id;
+}
+
+async function loadState() {
+  const [{ data: projects, error: pe }, { data: tasks, error: te }] = await Promise.all([
+    sb.from('projects').select('*').eq('board_id', boardId).order('created_at'),
+    sb.from('tasks').select('*').eq('board_id', boardId),
+  ]);
+  if (pe || te) throw pe || te;
+
+  state.projects = (projects || []).map(p => ({
+    id: p.id, name: p.name, color: p.color, createdAt: p.created_at,
+    tasks: (tasks || [])
+      .filter(t => t.project_id === p.id)
+      .map(t => ({
+        id: t.id, title: t.title, description: t.description,
+        assignee: t.assignee, dueDate: t.due_date, priority: t.priority,
+        column: t.column_name, order: t.sort_order,
+        createdAt: t.created_at, completedAt: t.completed_at,
+      }))
+      .sort((a, b) => a.order - b.order),
+  }));
+
+  state.activeProjectId = Store.getActiveId();
+  if (state.activeProjectId && !state.projects.find(p => p.id === state.activeProjectId))
     state.activeProjectId = null;
-  }
-  if (!state.activeProjectId && state.projects.length > 0) {
+  if (!state.activeProjectId && state.projects.length > 0)
     state.activeProjectId = state.projects[0].id;
-  }
   Store.setActiveId(state.activeProjectId);
+}
+
+function subscribeToRealtime() {
+  sb
+    .channel('board:' + boardId)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'projects',
+        filter: `board_id=eq.${boardId}` }, handleRemoteChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks',
+        filter: `board_id=eq.${boardId}` }, handleRemoteChange)
+    .subscribe();
+}
+
+let _reloadPending = false;
+async function handleRemoteChange() {
+  if (_reloadPending) return;
+  _reloadPending = true;
+  try {
+    await loadState();
+    renderSidebar();
+    renderMainView();
+  } finally {
+    _reloadPending = false;
+  }
 }
 
 function getActiveProject() {
@@ -728,7 +843,19 @@ function updateTaskColumnAndOrder(taskId, newColumn, columnOrders) {
     });
   });
 
-  Store.saveProjects(state.projects);
+  const proj = getActiveProject();
+  if (proj) {
+    const changed = [];
+    Object.values(columnOrders).forEach(ids => {
+      ids.forEach(id => {
+        const t = proj.tasks.find(t => t.id === id);
+        if (t) changed.push(t);
+      });
+    });
+    DB.upsertTasks(changed, proj.id).catch(() =>
+      showToast("Couldn't save order — please try again", 'error')
+    );
+  }
 }
 
 // =====================================================================
@@ -784,7 +911,7 @@ function openProjectModal(project = null) {
     if (e.key === 'Enter') $('#btn-save-project').click();
   });
 
-  $('#btn-save-project').addEventListener('click', () => {
+  $('#btn-save-project').addEventListener('click', async () => {
     const name = $('#proj-name').value.trim();
     if (!name) {
       $('#proj-name').focus();
@@ -803,7 +930,13 @@ function openProjectModal(project = null) {
       Store.setActiveId(p.id);
     }
 
-    Store.saveProjects(state.projects);
+    const projectToSave = isEdit ? project : state.projects[state.projects.length - 1];
+    try {
+      await DB.upsertProject(projectToSave);
+    } catch (_) {
+      showToast("Couldn't save — please try again", 'error');
+      return;
+    }
     closeModal();
     state.view = 'board';
     renderSidebar();
@@ -847,13 +980,18 @@ function confirmDeleteProject(projectId) {
 
   $('#modal-close').addEventListener('click', closeModal);
   $('#modal-cancel').addEventListener('click', closeModal);
-  $('#btn-confirm-delete').addEventListener('click', () => {
+  $('#btn-confirm-delete').addEventListener('click', async () => {
     state.projects = state.projects.filter(p => p.id !== projectId);
     if (state.activeProjectId === projectId) {
       state.activeProjectId = state.projects[0]?.id || null;
       Store.setActiveId(state.activeProjectId);
     }
-    Store.saveProjects(state.projects);
+    try {
+      await DB.deleteProject(projectId);
+    } catch (_) {
+      showToast("Couldn't delete — please try again", 'error');
+      return;
+    }
     closeModal();
     renderSidebar();
     renderMainView();
@@ -942,7 +1080,7 @@ function openTaskModal(task = null, defaultColumn = 'todo') {
     if (e.key === 'Enter' && !e.shiftKey) $('#btn-save-task').click();
   });
 
-  $('#btn-save-task').addEventListener('click', () => {
+  $('#btn-save-task').addEventListener('click', async () => {
     const title = $('#task-title').value.trim();
     if (!title) {
       $('#task-title').focus();
@@ -976,7 +1114,13 @@ function openTaskModal(task = null, defaultColumn = 'todo') {
       project.tasks.push(newTask);
     }
 
-    Store.saveProjects(state.projects);
+    const taskToSave = isEdit ? task : project.tasks[project.tasks.length - 1];
+    try {
+      await DB.upsertTask(taskToSave, project.id);
+    } catch (_) {
+      showToast("Couldn't save — please try again", 'error');
+      return;
+    }
     closeModal();
     renderSidebar();
     renderMainView();
@@ -1017,9 +1161,14 @@ function confirmDeleteTask(taskId) {
 
   $('#modal-close').addEventListener('click', closeModal);
   $('#modal-cancel').addEventListener('click', closeModal);
-  $('#btn-confirm-delete').addEventListener('click', () => {
+  $('#btn-confirm-delete').addEventListener('click', async () => {
     project.tasks = project.tasks.filter(t => t.id !== taskId);
-    Store.saveProjects(state.projects);
+    try {
+      await DB.deleteTask(taskId);
+    } catch (_) {
+      showToast("Couldn't delete — please try again", 'error');
+      return;
+    }
     closeModal();
     renderSidebar();
     renderMainView();
@@ -1114,11 +1263,101 @@ function attachEvents() {
 // =====================================================================
 // INIT
 // =====================================================================
-function init() {
-  loadState();
+function offerLocalStorageMigration() {
+  const raw = localStorage.getItem('ip_projects');
+  if (!raw || state.projects.length > 0) return;
+  if (localStorage.getItem('ip_migration_dismissed')) return;
+  let old;
+  try { old = JSON.parse(raw); } catch (_) { return; }
+  if (!Array.isArray(old) || !old.length) return;
+
+  const plural = old.length !== 1;
+  openModal(`
+    <div class="modal__header">
+      <h2 class="modal__title">Migrate Local Data?</h2>
+      <button class="modal__close" id="modal-close">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+          <line x1="2" y1="2" x2="14" y2="14" stroke-linecap="round"/>
+          <line x1="14" y1="2" x2="2" y2="14" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+    <div class="modal__body">
+      <p class="modal__confirm-text">
+        You have ${old.length} project${plural ? 's' : ''} saved in this browser from before.
+        Copy ${plural ? 'them' : 'it'} into this shared board?
+      </p>
+    </div>
+    <div class="modal__footer">
+      <div></div>
+      <div class="modal__footer-right">
+        <button class="btn-ghost" id="modal-cancel">Not now</button>
+        <button class="btn-primary" id="btn-migrate">Migrate</button>
+      </div>
+    </div>`);
+
+  const dismiss = () => {
+    localStorage.setItem('ip_migration_dismissed', '1');
+    closeModal();
+  };
+  $('#modal-close').addEventListener('click', dismiss);
+  $('#modal-cancel').addEventListener('click', dismiss);
+  $('#btn-migrate').addEventListener('click', async () => {
+    closeModal();
+    try {
+      for (const p of old) {
+        await DB.upsertProject(p);
+        for (const t of (p.tasks || [])) {
+          await DB.upsertTask(t, p.id);
+        }
+      }
+      localStorage.removeItem('ip_projects');
+      localStorage.removeItem('ip_active_project');
+      await loadState();
+      renderSidebar();
+      renderMainView();
+      showToast('Local data migrated to this board', 'success');
+    } catch (_) {
+      showToast("Migration failed — please try again", 'error');
+    }
+  });
+}
+
+async function init() {
+  try {
+    const config = await fetchConfig();
+    if (!config) {
+      showToast('Supabase credentials missing — set SUPABASE_URL / SUPABASE_ANON_KEY on Vercel, or fill in config.local.js', 'error');
+      return;
+    }
+    sb = window.supabase.createClient(config.supabaseUrl, config.supabaseKey);
+    boardId = await getOrCreateBoard();
+  } catch (_) {
+    showToast('Could not connect to server — check your Supabase configuration', 'error');
+    return;
+  }
+  await loadState();
+  subscribeToRealtime();
   renderSidebar();
   renderMainView();
   attachEvents();
+  addShareButton();
+  offerLocalStorageMigration();
+}
+
+function addShareButton() {
+  if (document.getElementById('btn-share')) return;
+  const btn = document.createElement('button');
+  btn.id = 'btn-share';
+  btn.className = 'btn-ghost';
+  btn.style.cssText = 'font-size:0.8rem;padding:0.35rem 0.75rem;white-space:nowrap;';
+  btn.textContent = 'Copy Share Link';
+  btn.addEventListener('click', () => {
+    navigator.clipboard.writeText(window.location.href)
+      .then(() => showToast('Board link copied!', 'success'))
+      .catch(() => showToast("Couldn't copy link", 'error'));
+  });
+  document.getElementById('board-header').appendChild(btn);
 }
 
 document.addEventListener('DOMContentLoaded', init);
